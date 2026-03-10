@@ -4,7 +4,7 @@ from matplotlib.widgets import Slider
 from collections import deque
 
 
-def compute_skeleton_angles(joints, kinematic_tree, joint_names):
+def compute_skeleton_angles(joints, joint_names, segments_map, kinematic_tree):
     """
     General purpose biomechanical angle extractor.
 
@@ -35,40 +35,26 @@ def compute_skeleton_angles(joints, kinematic_tree, joint_names):
     """
     N, K, _ = joints.shape
     name_to_idx = {name: i for i, name in enumerate(joint_names)}
-
-    # ---- Build children map (parent -> [child1, child2, ...]) ----
-    children_map = {}
-    for child_name, parent_name in kinematic_tree.items():
-        if parent_name:
-            children_map.setdefault(parent_name, []).append(child_name)
-
-    # ---- Pick a single canonical child per parent for LCS construction ----
-    preferred = {'pelvis': 'spine', 'neck': 'head'}
-    canonical_child = {}
-    for parent_name, kids in children_map.items():
-        if parent_name in preferred and preferred[parent_name] in kids:
-            canonical_child[parent_name] = preferred[parent_name]
-        else:
-            canonical_child[parent_name] = kids[0]
-
     # ---- Global lateral axis (left hip -> right hip, i.e. +X ~ right) ----
     l_hip, r_hip = name_to_idx['left hip'], name_to_idx['right hip']
-    global_lateral = joints[:, l_hip] - joints[:, r_hip]        # (N, 3)
+    global_lateral = joints[:, l_hip] - joints[:, r_hip]  # (N, 3)
     global_lateral /= (np.linalg.norm(global_lateral, axis=-1, keepdims=True) + 1e-8)
 
     # ---- Build LCS for every non-leaf joint ----
-    lcs_frames = {}   # idx -> (N, 3, 3)  columns = [x, y, z]
+    lcs_frames = {}  # idx -> (N, 3, 3)  columns = [x, y, z]
 
     for name in joint_names:
         idx = name_to_idx[name]
-        if name in canonical_child:
-            canon_idx = name_to_idx[canonical_child[name]]
-            v_long = joints[:, canon_idx] - joints[:, idx]          # parent -> child
+        if name in segments_map:
+            distal_name, c1, c2 = segments_map[name]
+            canon_idx = name_to_idx[distal_name]
+            v_long = joints[:, canon_idx] - joints[:, idx]  # parent -> child
             y = v_long / (np.linalg.norm(v_long, axis=-1, keepdims=True) + 1e-8)
             z = np.cross(y, global_lateral)
             z /= (np.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
             x = np.cross(y, z)
-            lcs_frames[idx] = np.stack([x, y, z], axis=-1)         # (N, 3, 3)
+            x, z = x * c1, z * c2  # apply any optional sign flips from segments_map
+            lcs_frames[idx] = np.stack([x, y, z], axis=-1)  # (N, 3, 3)
 
     # ---- Leaf joints inherit parent's LCS ----
     for name in joint_names:
@@ -88,19 +74,23 @@ def compute_skeleton_angles(joints, kinematic_tree, joint_names):
             continue
         c_idx = name_to_idx[child_name]
         p_idx = name_to_idx[parent_name]
-        R_child  = lcs_frames[c_idx]     # (N, 3, 3)
-        R_parent = lcs_frames[p_idx]     # (N, 3, 3)
+        R_child = lcs_frames[c_idx]  # (N, 3, 3)
+        R_parent = lcs_frames[p_idx]  # (N, 3, 3)
 
         # R_rel = R_parent^T @ R_child
-        R_rel = np.einsum('nij,nik->njk', R_parent, R_child)      # (N, 3, 3)
+        R_rel = np.einsum('nij,nik->njk', R_parent, R_child)  # (N, 3, 3)
 
         # Intrinsic XZY decomposition of  R = Rx(a0) @ Rz(a1) @ Ry(a2)
         #   R[0,1] = -sin(a1)
         #   R[2,1] =  sin(a0)*cos(a1)    R[1,1] = cos(a0)*cos(a1)
         #   R[0,2] =  sin(a2)*cos(a1)    R[0,0] = cos(a1)*cos(a2)
-        angles[:, c_idx, 0] = np.arctan2( R_rel[:, 2, 1], R_rel[:, 1, 1])   # flex
-        angles[:, c_idx, 1] = np.arcsin(np.clip(-R_rel[:, 0, 1], -1, 1))    # abd
-        angles[:, c_idx, 2] = np.arctan2( R_rel[:, 0, 2], R_rel[:, 0, 0])   # rot
+        angles[:, c_idx, 0] = np.arctan2(R_rel[:, 2, 1], R_rel[:, 1, 1])  # flex
+        angles[:, c_idx, 1] = np.arcsin(np.clip(-R_rel[:, 0, 1], -1, 1))  # abd
+        angles[:, c_idx, 2] = np.arctan2(R_rel[:, 0, 2], R_rel[:, 0, 0])  # rot
+        # Symetry Layer
+        if "left" in child_name.lower():
+            angles[:, c_idx, 1] *= -1  # Flip Abduction
+            angles[:, c_idx, 2] *= -1  # Flip Internal/External Rotation
 
     return np.degrees(angles)
 
@@ -123,7 +113,7 @@ class Biomech3DVisualizer:
         self.tree = kinematic_tree
         self.joint_names = joint_names
         self.name_to_idx = {name: i for i, name in enumerate(joint_names)}
-        self.original_coords = original_coords          # (K, 3) optional
+        self.original_coords = original_coords  # (K, 3) optional
 
         # Root orientation (3x3) - needed so FK starts in the same frame as
         # the LCS that compute_skeleton_angles built for the root.
@@ -184,16 +174,16 @@ class Biomech3DVisualizer:
         """Rx(flex) @ Rz(abd) @ Ry(rot)  -  intrinsic XZY."""
         flex, abd, rot = np.radians(angles_deg)
         cf, sf = np.cos(flex), np.sin(flex)
-        ca, sa = np.cos(abd),  np.sin(abd)
-        cr, sr = np.cos(rot),  np.sin(rot)
-        Rx = np.array([[1,  0,   0],
-                       [0,  cf, -sf],
-                       [0,  sf,  cf]])
-        Rz = np.array([[ ca, -sa, 0],
-                       [ sa,  ca, 0],
-                       [  0,   0, 1]])
-        Ry = np.array([[ cr, 0, sr],
-                       [  0, 1,  0],
+        ca, sa = np.cos(abd), np.sin(abd)
+        cr, sr = np.cos(rot), np.sin(rot)
+        Rx = np.array([[1, 0, 0],
+                       [0, cf, -sf],
+                       [0, sf, cf]])
+        Rz = np.array([[ca, -sa, 0],
+                       [sa, ca, 0],
+                       [0, 0, 1]])
+        Ry = np.array([[cr, 0, sr],
+                       [0, 1, 0],
                        [-sr, 0, cr]])
         return Rx @ Rz @ Ry
 
@@ -236,8 +226,16 @@ class Biomech3DVisualizer:
         orient = {root_name: self.root_lcs.copy()}
 
         for child, parent in self.ordered_edges:
-            R_rel = self._xzy_rotation(self.angles[child])
+            # Map symmetric UI angles back to mathematical angles for the FK solver
+            fk_angles = self.angles[child].copy()
+            if "left" in child.lower():
+                fk_angles[1] *= -1
+                fk_angles[2] *= -1
+
+            # FIXED: Use the mapped fk_angles instead of the raw slider angles
+            R_rel = self._xzy_rotation(fk_angles)
             orient[child] = orient[parent] @ R_rel
+
             # Bone direction from parent->child, expressed in parent's LCS
             bone_dir_local = self.bone_offsets[child] * self.lengths[child]
             bone = orient[parent] @ bone_dir_local
@@ -288,7 +286,9 @@ class Biomech3DVisualizer:
         self.ax.set_ylim(ctr[1] - span, ctr[1] + span)
         self.ax.set_zlim(ctr[2] - span, ctr[2] + span)
 
-        self.ax.set_xlabel('X'); self.ax.set_ylabel('Y'); self.ax.set_zlabel('Z')
+        self.ax.set_xlabel('X');
+        self.ax.set_ylabel('Y');
+        self.ax.set_zlabel('Z')
         self.ax.set_title('FK (blue) vs Original (red dashed)')
         self.ax.view_init(elev=15, azim=60)
         self.fig.canvas.draw_idle()
@@ -298,19 +298,29 @@ class Biomech3DVisualizer:
 #  Main - demo with raw coordinates
 # ---------------------------------------------------------------------------
 
-if __name__ == '__main__':
-
-    ktree = {
-        'pelvis': '',
-        'left hip': 'pelvis', 'right hip': 'pelvis',
-        'left knee': 'left hip', 'right knee': 'right hip',
-        'left ankle': 'left knee', 'right ankle': 'right knee',
-        'spine': 'pelvis', 'neck': 'spine',
-        'head': 'neck', 'head top': 'head',
-        'left shoulder': 'neck', 'right shoulder': 'neck',
-        'left elbow': 'left shoulder', 'right elbow': 'right shoulder',
-        'left wrist': 'left elbow', 'right wrist': 'right elbow',
+def main():
+    joint_defs = {
+        "pelvis": ["", "spine", 1, 1],
+        "spine": ["pelvis", "neck", 1, 1],
+        "neck": ["spine", "head", 1, 1],
+        "head": ["neck", "head top", 1, 1],
+        "head top": ["head", "", 1, 1],
+        "right hip": ["pelvis", "right knee", 1, 1],
+        "right knee": ["right hip", "right ankle", 1, 1],
+        "right ankle": ["right knee", "", 1, 1],
+        "left hip": ["pelvis", "left knee", 1, 1],
+        "left knee": ["left hip", "left ankle", 1, 1],
+        "left ankle": ["left knee", "", 1, 1],
+        "right shoulder": ["neck", "right elbow", 1, 1],
+        "right elbow": ["right shoulder", "right wrist", 1, 1],
+        "right wrist": ["right elbow", "", 1, 1],
+        "left shoulder": ["neck", "left elbow", 1, 1],
+        "left elbow": ["left shoulder", "left wrist", 1, 1],
+        "left wrist": ["left elbow", "", 1, 1]
     }
+    segments_map = {j: (distal, c1, c2) for j, (proximal, distal, c1, c2) in joint_defs.items() if distal}
+    ktree = {j: proximal for j, (proximal, distal, c1, c2) in joint_defs.items()}
+    #c_jnames = list(joint_defs.keys())
 
     jnames = [
         'pelvis', 'right hip', 'right knee', 'right ankle',
@@ -319,26 +329,29 @@ if __name__ == '__main__':
         'left shoulder', 'left elbow', 'left wrist',
         'right shoulder', 'right elbow', 'right wrist',
     ]
+    #print("Joint names:", jnames, c_jnames)
+    #print("Kinematic tree:", ktree, c_ktree)
+    #print("Segments map:", segments_map, c_segments_map)
 
     # A single frame of a mid-gait 3D pose (17 joints x 3)
     raw_coords = np.array([
-        [ 0.0024984,  6.8794e-06, -0.0007963],   # pelvis
-        [-0.0012018,  0.053859,    0.0014966],    # right hip
-        [-0.066229,   0.0030878,  -0.15618  ],    # right knee
-        [-0.04598,   -0.040396,   -0.32004  ],    # right ankle
-        [ 0.0047319, -0.051271,   -0.0031012],    # left hip
-        [-0.016447,  -0.077047,   -0.1662   ],    # left knee
-        [ 0.14184,   -0.02886,    -0.24666  ],    # left ankle
-        [ 0.0032881,  0.0044781,   0.10423  ],    # spine
-        [ 0.00029384, 0.023843,    0.22248  ],    # neck
-        [-0.051995,   0.018642,    0.2782   ],    # head
-        [-0.1071,     0.024215,    0.33435  ],    # head top
-        [ 0.00054328,-0.049722,    0.20746  ],    # left shoulder
-        [-0.00057531,-0.10344,     0.097328 ],    # left elbow
-        [-0.057034,  -0.10887,     0.020448 ],    # left wrist
-        [ 0.012189,   0.077975,    0.20765  ],    # right shoulder
-        [ 0.018423,   0.12456,     0.096108 ],    # right elbow
-        [-0.039036,   0.069698,    0.0088929],    # right wrist
+        [0.0024984, 6.8794e-06, -0.0007963],  # pelvis
+        [-0.0012018, 0.053859, 0.0014966],  # right hip
+        [-0.066229, 0.0030878, -0.15618],  # right knee
+        [-0.04598, -0.040396, -0.32004],  # right ankle
+        [0.0047319, -0.051271, -0.0031012],  # left hip
+        [-0.016447, -0.077047, -0.1662],  # left knee
+        [0.14184, -0.02886, -0.24666],  # left ankle
+        [0.0032881, 0.0044781, 0.10423],  # spine
+        [0.00029384, 0.023843, 0.22248],  # neck
+        [-0.051995, 0.018642, 0.2782],  # head
+        [-0.1071, 0.024215, 0.33435],  # head top
+        [0.00054328, -0.049722, 0.20746],  # left shoulder
+        [-0.00057531, -0.10344, 0.097328],  # left elbow
+        [-0.057034, -0.10887, 0.020448],  # left wrist
+        [0.012189, 0.077975, 0.20765],  # right shoulder
+        [0.018423, 0.12456, 0.096108],  # right elbow
+        [-0.039036, 0.069698, 0.0088929],  # right wrist
     ])
 
     name_to_idx = {n: i for i, n in enumerate(jnames)}
@@ -351,9 +364,8 @@ if __name__ == '__main__':
             bone_lengths[child] = float(np.linalg.norm(raw_coords[ci] - raw_coords[pi]))
 
     # ---- Compute angles ----
-    angles_deg = compute_skeleton_angles(
-        raw_coords[np.newaxis], ktree, jnames
-    ).squeeze()                                               # (K, 3)
+    angles_deg = compute_skeleton_angles(raw_coords[np.newaxis], jnames, segments_map,
+                                         kinematic_tree=ktree).squeeze()  # (K, 3)
 
     # ---- Recover root LCS so FK starts in the correct frame ----
     # (same construction as inside compute_skeleton_angles for the root)
@@ -364,9 +376,10 @@ if __name__ == '__main__':
     pelvis_idx = name_to_idx['pelvis']
     v_long = raw_coords[spine_idx] - raw_coords[pelvis_idx]
     y = v_long / (np.linalg.norm(v_long) + 1e-8)
-    z = np.cross(y, g_lat);  z /= (np.linalg.norm(z) + 1e-8)
+    z = np.cross(y, g_lat);
+    z /= (np.linalg.norm(z) + 1e-8)
     x = np.cross(y, z)
-    root_lcs = np.stack([x, y, z], axis=-1)                   # (3, 3)
+    root_lcs = np.stack([x, y, z], axis=-1)  # (3, 3)
 
     # ---- Rebuild all LCS frames to compute bone offsets ----
     # We need each parent's LCS to express bone directions in local coords
@@ -390,7 +403,8 @@ if __name__ == '__main__':
             idx = name_to_idx[name]
             vl = raw_coords[ci] - raw_coords[idx]
             yy = vl / (np.linalg.norm(vl) + 1e-8)
-            zz = np.cross(yy, g_lat); zz /= (np.linalg.norm(zz) + 1e-8)
+            zz = np.cross(yy, g_lat);
+            zz /= (np.linalg.norm(zz) + 1e-8)
             xx = np.cross(yy, zz)
             lcs_single[name] = np.stack([xx, yy, zz], axis=-1)
     # Leaf joints inherit parent's LCS
@@ -446,10 +460,15 @@ if __name__ == '__main__':
     # First verify orient propagation matches lcs_single
     print("\nLCS propagation check (FK orient vs coord-derived LCS):")
     for child, parent in bfs_edges:
-        flex, abd, rot = np.radians(angles_deg[name_to_idx[child]])
+        fk_angles = angles_deg[name_to_idx[child]].copy()
+        if "left" in child.lower():
+            fk_angles[1] *= -1
+            fk_angles[2] *= -1
+
+        flex, abd, rot = np.radians(fk_angles)
         cf, sf = np.cos(flex), np.sin(flex)
-        ca, sa = np.cos(abd),  np.sin(abd)
-        cr, sr = np.cos(rot),  np.sin(rot)
+        ca, sa = np.cos(abd), np.sin(abd)
+        cr, sr = np.cos(rot), np.sin(rot)
         Rx = np.array([[1, 0, 0], [0, cf, -sf], [0, sf, cf]])
         Rz = np.array([[ca, -sa, 0], [sa, ca, 0], [0, 0, 1]])
         Ry = np.array([[cr, 0, sr], [0, 1, 0], [-sr, 0, cr]])
@@ -491,3 +510,6 @@ if __name__ == '__main__':
     )
     plt.show()
 
+
+if __name__ == '__main__':
+    main()
