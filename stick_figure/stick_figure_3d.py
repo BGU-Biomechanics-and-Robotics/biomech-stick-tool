@@ -4,7 +4,7 @@ from matplotlib.widgets import Slider
 from collections import deque
 
 
-def compute_skeleton_angles(joints, joint_names, segments_map, kinematic_tree):
+def compute_skeleton_angles(joints, joint_names, segments_map, kinematic_tree, sign_map=None):
     """
     General purpose biomechanical angle extractor.
 
@@ -46,14 +46,14 @@ def compute_skeleton_angles(joints, joint_names, segments_map, kinematic_tree):
     for name in joint_names:
         idx = name_to_idx[name]
         if name in segments_map:
-            distal_name, c1, c2 = segments_map[name]
+            distal_name, c1 = segments_map[name]
             canon_idx = name_to_idx[distal_name]
             v_long = joints[:, canon_idx] - joints[:, idx]  # parent -> child
+            v_long = v_long * c1  # Apply c1: flip Y-axis for limbs so straight = 0°
             y = v_long / (np.linalg.norm(v_long, axis=-1, keepdims=True) + 1e-8)
             z = np.cross(y, global_lateral)
             z /= (np.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
             x = np.cross(y, z)
-            x, z = x * c1, z * c2  # apply any optional sign flips from segments_map
             lcs_frames[idx] = np.stack([x, y, z], axis=-1)  # (N, 3, 3)
 
     # ---- Leaf joints inherit parent's LCS ----
@@ -87,12 +87,19 @@ def compute_skeleton_angles(joints, joint_names, segments_map, kinematic_tree):
         angles[:, c_idx, 0] = np.arctan2(R_rel[:, 2, 1], R_rel[:, 1, 1])  # flex
         angles[:, c_idx, 1] = np.arcsin(np.clip(-R_rel[:, 0, 1], -1, 1))  # abd
         angles[:, c_idx, 2] = np.arctan2(R_rel[:, 0, 2], R_rel[:, 0, 0])  # rot
-        # Symetry Layer
-        if "left" in child_name.lower():
-            angles[:, c_idx, 1] *= -1  # Flip Abduction
-            angles[:, c_idx, 2] *= -1  # Flip Internal/External Rotation
+    angles = np.degrees(angles)
 
-    return np.degrees(angles)
+    # Anatomical Convention Layer: per-joint sign presentation
+    # This single layer handles both bilateral symmetry (abd/rot flip for
+    # left-side joints) and joint-specific conventions (e.g. positive knee
+    # flexion), all driven by the sign array in joint_defs.
+    if sign_map is not None:
+        for name, sign in sign_map.items():
+            idx = name_to_idx.get(name)
+            if idx is not None:
+                angles[:, idx, :] *= sign[np.newaxis, :]
+
+    return angles
 
 
 # ---------------------------------------------------------------------------
@@ -107,13 +114,15 @@ class Biomech3DVisualizer:
     coordinates (when provided) so you can verify correctness.
     """
 
-    def __init__(self, kinematic_tree, joint_names, initial_angles=None,
+    def __init__(self, kinematic_tree, joint_names, segments_map, initial_angles=None,
                  bone_lengths=None, original_coords=None, root_lcs=None,
-                 bone_offsets=None):
+                 bone_offsets=None, sign_map=None):
         self.tree = kinematic_tree
         self.joint_names = joint_names
         self.name_to_idx = {name: i for i, name in enumerate(joint_names)}
         self.original_coords = original_coords  # (K, 3) optional
+        self.segments_map = segments_map
+        self.sign_map = sign_map or {n: np.ones(3) for n in joint_names}
 
         # Root orientation (3x3) - needed so FK starts in the same frame as
         # the LCS that compute_skeleton_angles built for the root.
@@ -226,13 +235,9 @@ class Biomech3DVisualizer:
         orient = {root_name: self.root_lcs.copy()}
 
         for child, parent in self.ordered_edges:
-            # Map symmetric UI angles back to mathematical angles for the FK solver
+            # Reverse the anatomical convention layer to get pure math angles
             fk_angles = self.angles[child].copy()
-            if "left" in child.lower():
-                fk_angles[1] *= -1
-                fk_angles[2] *= -1
-
-            # FIXED: Use the mapped fk_angles instead of the raw slider angles
+            fk_angles *= self.sign_map[child]
             R_rel = self._xzy_rotation(fk_angles)
             orient[child] = orient[parent] @ R_rel
 
@@ -299,27 +304,37 @@ class Biomech3DVisualizer:
 # ---------------------------------------------------------------------------
 
 def main():
+    # joint_defs: [parent, canonical_child, c1, sign]
+    #   c1:   LCS Y-axis direction multiplier (-1 flips bone to point toward torso)
+    #   sign: [flex, abd, rot] anatomical presentation multipliers
+    #         Handles BOTH bilateral symmetry (abd/rot flip for left joints)
+    #         AND joint-specific conventions (e.g. positive knee flexion).
     joint_defs = {
-        "pelvis": ["", "spine", 1, 1],
-        "spine": ["pelvis", "neck", 1, 1],
-        "neck": ["spine", "head", 1, 1],
-        "head": ["neck", "head top", 1, 1],
-        "head top": ["head", "", 1, 1],
-        "right hip": ["pelvis", "right knee", 1, 1],
-        "right knee": ["right hip", "right ankle", 1, 1],
-        "right ankle": ["right knee", "", 1, 1],
-        "left hip": ["pelvis", "left knee", 1, 1],
-        "left knee": ["left hip", "left ankle", 1, 1],
-        "left ankle": ["left knee", "", 1, 1],
-        "right shoulder": ["neck", "right elbow", 1, 1],
-        "right elbow": ["right shoulder", "right wrist", 1, 1],
-        "right wrist": ["right elbow", "", 1, 1],
-        "left shoulder": ["neck", "left elbow", 1, 1],
-        "left elbow": ["left shoulder", "left wrist", 1, 1],
-        "left wrist": ["left elbow", "", 1, 1]
+        "pelvis": ["", "spine", 1, [1, 1, 1]],
+        "spine": ["pelvis", "neck", 1, [-1, 1, 1]],
+        "neck": ["spine", "head", 1, [-1, 1, 1]],
+        "head": ["neck", "head top", 1, [1, 1, 1]],
+        "head top": ["head", "", 1, [1, 1, 1]],
+
+        # Right arm/leg: c1=-1 (bone Y points toward torso for 0° straight limb)
+        "right hip": ["pelvis", "right knee", -1, [1, 1, 1]],
+        "right knee": ["right hip", "right ankle", -1, [-1, 1, 1]],
+        "right ankle": ["right knee", "", -1, [1, 1, 1]],
+        "right shoulder": ["neck", "right elbow", -1, [1, 1, 1]],
+        "right elbow": ["right shoulder", "right wrist", -1, [1, 1, 1]],
+        "right wrist": ["right elbow", "", -1, [1, 1, 1]],
+
+        # Left arm/leg: c1=-1, sign flips abd & rot for bilateral symmetry
+        "left hip": ["pelvis", "left knee", -1, [1, -1, -1]],
+        "left knee": ["left hip", "left ankle", -1, [-1, -1, -1]],
+        "left ankle": ["left knee", "", -1, [1, -1, -1]],
+        "left shoulder": ["neck", "left elbow", -1, [1, -1, -1]],
+        "left elbow": ["left shoulder", "left wrist", -1, [1, -1, -1]],
+        "left wrist": ["left elbow", "", -1, [1, -1, -1]]
     }
-    segments_map = {j: (distal, c1, c2) for j, (proximal, distal, c1, c2) in joint_defs.items() if distal}
-    ktree = {j: proximal for j, (proximal, distal, c1, c2) in joint_defs.items()}
+    segments_map = {j: (distal, c1) for j, (proximal, distal, c1, sign) in joint_defs.items() if distal}
+    sign_map = {j: np.array(sign, dtype=float) for j, (proximal, distal, c1, sign) in joint_defs.items()}
+    ktree = {j: proximal for j, (proximal, distal, c1, sign) in joint_defs.items()}
     #c_jnames = list(joint_defs.keys())
 
     jnames = [
@@ -365,7 +380,8 @@ def main():
 
     # ---- Compute angles ----
     angles_deg = compute_skeleton_angles(raw_coords[np.newaxis], jnames, segments_map,
-                                         kinematic_tree=ktree).squeeze()  # (K, 3)
+                                         kinematic_tree=ktree,
+                                         sign_map=sign_map).squeeze()  # (K, 3)
 
     # ---- Recover root LCS so FK starts in the correct frame ----
     # (same construction as inside compute_skeleton_angles for the root)
@@ -402,6 +418,13 @@ def main():
             ci = name_to_idx[canonical_child[name]]
             idx = name_to_idx[name]
             vl = raw_coords[ci] - raw_coords[idx]
+
+            c1 = 1
+            if name in segments_map:
+                _, c1 = segments_map[name]
+
+            vl = vl * c1
+
             yy = vl / (np.linalg.norm(vl) + 1e-8)
             zz = np.cross(yy, g_lat);
             zz /= (np.linalg.norm(zz) + 1e-8)
@@ -461,10 +484,8 @@ def main():
     print("\nLCS propagation check (FK orient vs coord-derived LCS):")
     for child, parent in bfs_edges:
         fk_angles = angles_deg[name_to_idx[child]].copy()
-        if "left" in child.lower():
-            fk_angles[1] *= -1
-            fk_angles[2] *= -1
-
+        # Reverse the anatomical convention layer to get pure math angles
+        fk_angles *= sign_map[child]
         flex, abd, rot = np.radians(fk_angles)
         cf, sf = np.cos(flex), np.sin(flex)
         ca, sa = np.cos(abd), np.sin(abd)
@@ -500,16 +521,19 @@ def main():
         print("  FAIL - FK reconstruction does NOT match.")
 
     # ---- Launch interactive GUI ----
-    viz = Biomech3DVisualizer(
-        ktree, jnames,
-        initial_angles=angles_deg,
-        bone_lengths=bone_lengths,
-        original_coords=raw_coords,
-        root_lcs=root_lcs,
-        bone_offsets=bone_offsets,
-    )
-    plt.show()
+    if '--no-gui' not in sys.argv:
+        viz = Biomech3DVisualizer(
+            ktree, jnames, segments_map,
+            initial_angles=angles_deg,
+            bone_lengths=bone_lengths,
+            original_coords=raw_coords,
+            root_lcs=root_lcs,
+            bone_offsets=bone_offsets,
+            sign_map=sign_map,
+        )
+        plt.show()
 
 
 if __name__ == '__main__':
+    import sys
     main()
